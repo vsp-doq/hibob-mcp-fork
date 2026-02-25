@@ -67,7 +67,7 @@ def hibob_people_search(fields: list = None, filters: list = None, humanReadable
     if filters:
         body["filters"] = filters
     if humanReadable:
-        body["humanReadable"] = humanReadable
+        body["humanReadable"] = True
     return _hibob_api_call("people/search", body)
 
 @mcp.tool()
