@@ -88,16 +88,23 @@ def _resolve_list_values(employees: list, requested_fields: list) -> list:
     if not id_to_display:
         return employees
 
-    # Replace numeric IDs in employee records
+    # Replace numeric IDs in employee records (both dotted and slash-prefixed formats)
     for emp in employees:
         for field_id in list_field_map:
             parts = field_id.split(".")
             if len(parts) == 2:
                 cat, fname = parts
+                # Resolve dotted format: emp["work"]["title"] = "253271839" → "CEO"
                 if isinstance(emp.get(cat), dict) and fname in emp[cat]:
                     raw = str(emp[cat][fname])
                     if raw in id_to_display:
                         emp[cat][fname] = id_to_display[raw]
+                # Resolve slash-prefixed format: emp["/work/title"]["value"] = "253271839" → "CEO"
+                slash_key = f"/{cat}/{fname}"
+                if isinstance(emp.get(slash_key), dict) and "value" in emp[slash_key]:
+                    raw = str(emp[slash_key]["value"])
+                    if raw in id_to_display:
+                        emp[slash_key]["value"] = id_to_display[raw]
 
     return employees
 
