@@ -159,6 +159,100 @@ def hibob_people_search(fields: list = None, filters: list = None, humanReadable
     return result
 
 @mcp.tool()
+def hibob_get_org_chart() -> str:
+    """
+    Get the complete organizational hierarchy as a compact tree.
+    Use this for ANY hierarchy or team question: who is the CEO, who reports to
+    whom, team structures, department breakdowns, manager lookups, org chart
+    traversal, how many people are in a team, etc.
+    Returns ALL employees in a tree format with name, title, department, and email.
+    """
+    fields = ["root.id", "root.firstName", "root.surname", "root.email",
+              "work.title", "work.reportsTo", "work.department"]
+    body = {"fields": fields}
+    result = _hibob_api_call("people/search", body)
+    employees = result.get("employees", [])
+
+    # Resolve list field IDs to display values
+    employees = _resolve_list_values(employees, fields)
+
+    # Build employee lookup and parent-child relationships
+    emp_by_id = {}
+    children = {}   # parent_id -> [child_ids]
+    roots = []      # employees with no manager
+
+    for emp in employees:
+        emp_id = _get_field(emp, "root", "id")
+        if not emp_id:
+            continue
+        emp_id = str(emp_id)
+        emp_by_id[emp_id] = emp
+
+        work = emp.get("work", {})
+        reports_to = work.get("reportsTo") if isinstance(work, dict) else None
+
+        if reports_to and isinstance(reports_to, dict):
+            manager_id = str(reports_to.get("id", ""))
+            if manager_id:
+                children.setdefault(manager_id, []).append(emp_id)
+            else:
+                roots.append(emp_id)
+        else:
+            roots.append(emp_id)
+
+    # Render compact tree
+    lines = [f"ORG CHART ({len(employees)} employees)\n"]
+
+    def render_tree(eid, indent=0):
+        emp = emp_by_id.get(eid)
+        if not emp:
+            return
+        prefix = "  " * indent
+        lines.append(f"{prefix}{_compact_display(emp)}")
+        for child_id in sorted(children.get(eid, []),
+                               key=lambda c: _compact_display(emp_by_id.get(c, {}))):
+            render_tree(child_id, indent + 1)
+
+    for root_id in sorted(roots, key=lambda r: _compact_display(emp_by_id.get(r, {}))):
+        render_tree(root_id)
+
+    return "\n".join(lines)
+
+
+def _get_field(emp: dict, category: str, field_name: str):
+    """Get a field value from either dotted or slash-prefixed format."""
+    # Dotted format: emp["root"]["id"]
+    cat_data = emp.get(category)
+    if isinstance(cat_data, dict) and field_name in cat_data:
+        return cat_data[field_name]
+    # Slash format: emp["/root/id"]["value"]
+    slash_key = f"/{category}/{field_name}"
+    slash_data = emp.get(slash_key)
+    if isinstance(slash_data, dict) and "value" in slash_data:
+        return slash_data["value"]
+    return None
+
+
+def _compact_display(emp: dict) -> str:
+    """Build a compact one-line display: Name | Title | Department | Email"""
+    first = _get_field(emp, "root", "firstName") or ""
+    last = _get_field(emp, "root", "surname") or ""
+    email = _get_field(emp, "root", "email") or ""
+    title = _get_field(emp, "work", "title") or ""
+    dept = _get_field(emp, "work", "department") or ""
+
+    name = f"{first} {last}".strip() or "(unnamed)"
+    parts = [name]
+    if title:
+        parts.append(title)
+    if dept:
+        parts.append(dept)
+    if email:
+        parts.append(email)
+    return " | ".join(parts)
+
+
+@mcp.tool()
 def hibob_get_employee_fields() -> dict:
     """
     Get metadata about all employee fields from HiBob.
