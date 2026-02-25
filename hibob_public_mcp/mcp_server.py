@@ -150,6 +150,12 @@ def hibob_people_search(fields: list = None, filters: list = None, humanReadable
     result = _hibob_api_call("people/search", body)
     if humanReadable and fields:
         result["employees"] = _resolve_list_values(result.get("employees", []), fields)
+        # Sort employees: reportsTo=null first (top-level leadership visible before truncation)
+        employees = result.get("employees", [])
+        result["employees"] = sorted(
+            employees,
+            key=lambda e: 0 if (isinstance(e.get("work"), dict) and e["work"].get("reportsTo") is None) else 1
+        )
     return result
 
 @mcp.tool()
