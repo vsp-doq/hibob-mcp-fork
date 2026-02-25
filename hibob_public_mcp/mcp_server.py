@@ -66,10 +66,9 @@ def hibob_people_search(fields: list = None, filters: list = None, humanReadable
         body["fields"] = fields
     if filters:
         body["filters"] = filters
-    params = {}
     if humanReadable:
-        params["humanReadable"] = humanReadable
-    return _hibob_api_call("people/search", body, params=params)
+        body["humanReadable"] = humanReadable
+    return _hibob_api_call("people/search", body)
 
 @mcp.tool()
 def hibob_get_employee_fields() -> dict:
