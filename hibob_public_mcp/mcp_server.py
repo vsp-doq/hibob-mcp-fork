@@ -5,6 +5,10 @@ import os
 # Create a server instance
 mcp = FastMCP(name="Hibob Public MCP")
 
+# Module-level caches (persist for the lifetime of the MCP subprocess)
+_field_metadata_cache = None
+_named_lists_cache = {}
+
 def _hibob_api_call(endpoint: str, body: dict = None, method: str = "POST", params: dict = None) -> dict:
     """Helper to call the HiBob API with proper headers, supporting GET, POST, PUT, PATCH, and DELETE."""
     url = f"https://api.hibob.com/v1/{endpoint}"
@@ -26,6 +30,76 @@ def _hibob_api_call(endpoint: str, body: dict = None, method: str = "POST", para
         response = requests.delete(url, headers=headers, params=params)
     response.raise_for_status()
     return response.json()
+
+def _get_field_metadata():
+    """Fetch field metadata, cached for the lifetime of the MCP subprocess."""
+    global _field_metadata_cache
+    if _field_metadata_cache is None:
+        try:
+            _field_metadata_cache = _hibob_api_call("company/people/fields", method="GET")
+        except Exception:
+            _field_metadata_cache = []
+    return _field_metadata_cache
+
+def _get_named_list(list_id: str) -> dict:
+    """Fetch a named list by ID, cached for the lifetime of the MCP subprocess."""
+    global _named_lists_cache
+    if list_id not in _named_lists_cache:
+        try:
+            _named_lists_cache[list_id] = _hibob_api_call(f"company/named-lists/{list_id}", method="GET")
+        except Exception:
+            _named_lists_cache[list_id] = {}
+    return _named_lists_cache[list_id]
+
+def _resolve_list_values(employees: list, requested_fields: list) -> list:
+    """Resolve numeric list-field IDs to human-readable display values using company named-lists."""
+    if not employees or not requested_fields:
+        return employees
+
+    fields_meta = _get_field_metadata()
+    if not fields_meta:
+        return employees
+
+    # Find list-type fields among the requested fields
+    list_field_map = {}  # field_id -> listId
+    for field in fields_meta:
+        if not isinstance(field, dict):
+            continue
+        if field.get("type") in ("list", "multi-list", "hierarchy-list"):
+            field_id = field.get("id", "")
+            if field_id in requested_fields:
+                list_id = (field.get("typeData") or {}).get("listId")
+                if list_id:
+                    list_field_map[field_id] = list_id
+
+    if not list_field_map:
+        return employees
+
+    # Build ID → display-value mappings from named lists
+    id_to_display = {}
+    for field_id, list_id in list_field_map.items():
+        list_data = _get_named_list(list_id)
+        for item in list_data.get("values", []):
+            item_id = str(item.get("id", ""))
+            display = item.get("value") or item.get("name", "")
+            if item_id and display:
+                id_to_display[item_id] = display
+
+    if not id_to_display:
+        return employees
+
+    # Replace numeric IDs in employee records
+    for emp in employees:
+        for field_id in list_field_map:
+            parts = field_id.split(".")
+            if len(parts) == 2:
+                cat, fname = parts
+                if isinstance(emp.get(cat), dict) and fname in emp[cat]:
+                    raw = str(emp[cat][fname])
+                    if raw in id_to_display:
+                        emp[cat][fname] = id_to_display[raw]
+
+    return employees
 
 @mcp.tool()
 def hibob_people_search(fields: list = None, filters: list = None, humanReadable: str = None) -> dict:
@@ -66,9 +140,10 @@ def hibob_people_search(fields: list = None, filters: list = None, humanReadable
         body["fields"] = fields
     if filters:
         body["filters"] = filters
-    if humanReadable:
-        body["humanReadable"] = True
-    return _hibob_api_call("people/search", body)
+    result = _hibob_api_call("people/search", body)
+    if humanReadable and fields:
+        result["employees"] = _resolve_list_values(result.get("employees", []), fields)
+    return result
 
 @mcp.tool()
 def hibob_get_employee_fields() -> dict:
