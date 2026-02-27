@@ -1,22 +1,30 @@
 from fastmcp import FastMCP
 import requests
 import os
+import time
 
-# Create a server instance
 mcp = FastMCP(name="Hibob Public MCP")
 
-# Module-level caches (persist for the lifetime of the MCP subprocess)
 _field_metadata_cache = None
 _named_lists_cache = {}
+_employee_cache = None
+_employee_cache_ts = 0
+_EMPLOYEE_CACHE_TTL = 300
+
+_STANDARD_FIELDS = [
+    "root.id", "root.firstName", "root.surname", "root.email",
+    "work.title", "work.department", "work.site", "work.reportsTo",
+    "work.startDate",
+]
+
 
 def _hibob_api_call(endpoint: str, body: dict = None, method: str = "POST", params: dict = None) -> dict:
-    """Helper to call the HiBob API with proper headers, supporting GET, POST, PUT, PATCH, and DELETE."""
     url = f"https://api.hibob.com/v1/{endpoint}"
     hibob_token = os.environ.get("HIBOB_API_TOKEN", "")
     headers = {
-        'authorization': f'Basic {hibob_token}',
-        'content-type': 'application/json',
-        'X-Request-Source': 'hibob-public-mcp'
+        "authorization": f"Basic {hibob_token}",
+        "content-type": "application/json",
+        "X-Request-Source": "hibob-public-mcp",
     }
     if method == "GET":
         response = requests.get(url, headers=headers, params=params)
@@ -31,8 +39,8 @@ def _hibob_api_call(endpoint: str, body: dict = None, method: str = "POST", para
     response.raise_for_status()
     return response.json()
 
+
 def _get_field_metadata():
-    """Fetch field metadata, cached for the lifetime of the MCP subprocess."""
     global _field_metadata_cache
     if _field_metadata_cache is None:
         try:
@@ -41,8 +49,8 @@ def _get_field_metadata():
             _field_metadata_cache = []
     return _field_metadata_cache
 
+
 def _get_named_list(list_id: str) -> dict:
-    """Fetch a named list by ID, cached for the lifetime of the MCP subprocess."""
     global _named_lists_cache
     if list_id not in _named_lists_cache:
         try:
@@ -51,8 +59,8 @@ def _get_named_list(list_id: str) -> dict:
             _named_lists_cache[list_id] = {}
     return _named_lists_cache[list_id]
 
+
 def _resolve_list_values(employees: list, requested_fields: list) -> list:
-    """Resolve numeric list-field IDs to human-readable display values using company named-lists."""
     if not employees or not requested_fields:
         return employees
 
@@ -60,8 +68,7 @@ def _resolve_list_values(employees: list, requested_fields: list) -> list:
     if not fields_meta:
         return employees
 
-    # Find list-type fields among the requested fields
-    list_field_map = {}  # field_id -> listId
+    list_field_map = {}
     for field in fields_meta:
         if not isinstance(field, dict):
             continue
@@ -75,7 +82,6 @@ def _resolve_list_values(employees: list, requested_fields: list) -> list:
     if not list_field_map:
         return employees
 
-    # Build ID → display-value mappings from named lists
     id_to_display = {}
     for field_id, list_id in list_field_map.items():
         list_data = _get_named_list(list_id)
@@ -88,18 +94,15 @@ def _resolve_list_values(employees: list, requested_fields: list) -> list:
     if not id_to_display:
         return employees
 
-    # Replace numeric IDs in employee records (both dotted and slash-prefixed formats)
     for emp in employees:
         for field_id in list_field_map:
             parts = field_id.split(".")
             if len(parts) == 2:
                 cat, fname = parts
-                # Resolve dotted format: emp["work"]["title"] = "253271839" → "CEO"
                 if isinstance(emp.get(cat), dict) and fname in emp[cat]:
                     raw = str(emp[cat][fname])
                     if raw in id_to_display:
                         emp[cat][fname] = id_to_display[raw]
-                # Resolve slash-prefixed format: emp["/work/title"]["value"] = "253271839" → "CEO"
                 slash_key = f"/{cat}/{fname}"
                 if isinstance(emp.get(slash_key), dict) and "value" in emp[slash_key]:
                     raw = str(emp[slash_key]["value"])
@@ -108,78 +111,169 @@ def _resolve_list_values(employees: list, requested_fields: list) -> list:
 
     return employees
 
+
+def _get_field(emp: dict, category: str, field_name: str):
+    cat_data = emp.get(category)
+    if isinstance(cat_data, dict) and field_name in cat_data:
+        return cat_data[field_name]
+    slash_key = f"/{category}/{field_name}"
+    slash_data = emp.get(slash_key)
+    if isinstance(slash_data, dict) and "value" in slash_data:
+        return slash_data["value"]
+    return None
+
+
+def _compact_display(emp: dict) -> str:
+    first = _get_field(emp, "root", "firstName") or ""
+    last = _get_field(emp, "root", "surname") or ""
+    email = _get_field(emp, "root", "email") or ""
+    title = _get_field(emp, "work", "title") or ""
+    dept = _get_field(emp, "work", "department") or ""
+    site = _get_field(emp, "work", "site") or ""
+
+    name = f"{first} {last}".strip() or "(unnamed)"
+    parts = [name]
+    if title:
+        parts.append(title)
+    if dept:
+        parts.append(dept)
+    if site:
+        parts.append(site)
+    if email:
+        parts.append(email)
+    return " | ".join(parts)
+
+
+def _get_all_employees() -> list:
+    global _employee_cache, _employee_cache_ts
+    if _employee_cache is not None and (time.time() - _employee_cache_ts) < _EMPLOYEE_CACHE_TTL:
+        return _employee_cache
+
+    body = {"fields": _STANDARD_FIELDS}
+    result = _hibob_api_call("people/search", body)
+    employees = result.get("employees", [])
+    employees = _resolve_list_values(employees, _STANDARD_FIELDS)
+    _employee_cache = employees
+    _employee_cache_ts = time.time()
+    return employees
+
+
+def _employee_profile(emp: dict) -> str:
+    eid = _get_field(emp, "root", "id") or ""
+    first = _get_field(emp, "root", "firstName") or ""
+    last = _get_field(emp, "root", "surname") or ""
+    email = _get_field(emp, "root", "email") or ""
+    title = _get_field(emp, "work", "title") or ""
+    dept = _get_field(emp, "work", "department") or ""
+    site = _get_field(emp, "work", "site") or ""
+    start = _get_field(emp, "work", "startDate") or ""
+    reports_to = ""
+    work = emp.get("work", {})
+    rt = work.get("reportsTo") if isinstance(work, dict) else None
+    if rt and isinstance(rt, dict):
+        rt_name = rt.get("displayName") or rt.get("email") or ""
+        if rt_name:
+            reports_to = rt_name
+
+    name = f"{first} {last}".strip()
+    lines = [f"Name: {name}"]
+    if eid:
+        lines.append(f"ID: {eid}")
+    if email:
+        lines.append(f"Email: {email}")
+    if title:
+        lines.append(f"Title: {title}")
+    if dept:
+        lines.append(f"Department: {dept}")
+    if site:
+        lines.append(f"Site: {site}")
+    if start:
+        lines.append(f"Start Date: {start}")
+    if reports_to:
+        lines.append(f"Reports To: {reports_to}")
+    return "\n".join(lines)
+
+
+def _match_employee(emp: dict, query: str) -> bool:
+    q = query.lower()
+    first = (_get_field(emp, "root", "firstName") or "").lower()
+    last = (_get_field(emp, "root", "surname") or "").lower()
+    email = (_get_field(emp, "root", "email") or "").lower()
+    full_name = f"{first} {last}".strip()
+    return q in full_name or q in email or q in first or q in last
+
+
 @mcp.tool()
-def hibob_people_search(fields: list = None, filters: list = None, humanReadable: str = None) -> dict:
-    """
-    Search for employees in HiBob using advanced filters.
+def hibob_get_employee(query: str) -> str:
+    """Look up employees by name or email. Returns compact profile(s) with ID, title, department, site, start date, and manager.
 
     Parameters:
-        fields (list, optional): List of field paths to return for each employee. Use hibob_get_employee_fields to discover available fields.
-        filters (list, optional): filter by ID or email. Options - 
-        Example filter usage:
-        filters = [
-            {
-                "fieldPath": "root.id",
-                "operator": "equals",
-                "values": ["EMPLOYEE_ID"]
-            }
-        ] 
-        OR
-        filters = [
-            {
-                "fieldPath": "root.email",
-                "operator": "equals",
-                "values": ["bla@example.com"]
-            }
-        ]
-
-        to find employee by name you need to fetch with empty filters and then filter by name by yourself.
-
-        humanReadable (str, optional): Pass "REPLACE" to get human-readable display
-            names for list fields (e.g. work.title, work.department) instead of
-            numeric IDs. When set to "APPEND", both the ID and display name are
-            returned. Default is None (numeric IDs only).
-
-    To get available field paths for fields, use the hibob_get_employee_fields tool.
+        query (str): Full or partial name, or email address to search for.
     """
-    body = {}
-    if fields:
-        body["fields"] = fields
-    if filters:
-        body["filters"] = filters
-    result = _hibob_api_call("people/search", body)
-    if humanReadable and fields:
-        result["employees"] = _resolve_list_values(result.get("employees", []), fields)
-        # Sort employees: reportsTo=null first (top-level leadership visible before truncation)
-        employees = result.get("employees", [])
-        result["employees"] = sorted(
-            employees,
-            key=lambda e: 0 if (isinstance(e.get("work"), dict) and e["work"].get("reportsTo") is None) else 1
-        )
-    return result
+    employees = _get_all_employees()
+    matches = [e for e in employees if _match_employee(e, query)]
+
+    if not matches:
+        return f"No employees found matching '{query}'."
+
+    if len(matches) == 1:
+        return _employee_profile(matches[0])
+
+    lines = [f"Found {len(matches)} employees matching '{query}':\n"]
+    for emp in matches[:20]:
+        lines.append(_employee_profile(emp))
+        lines.append("")
+    if len(matches) > 20:
+        lines.append(f"... and {len(matches) - 20} more. Refine your query.")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def hibob_get_team(department: str = None, site: str = None) -> str:
+    """List employees filtered by department and/or site. Returns a compact list.
+
+    Parameters:
+        department (str, optional): Department name to filter by (case-insensitive partial match).
+        site (str, optional): Site/office name to filter by (case-insensitive partial match).
+
+    At least one filter must be provided.
+    """
+    if not department and not site:
+        return "Error: Provide at least one filter (department or site)."
+
+    employees = _get_all_employees()
+    matches = employees
+
+    if department:
+        d = department.lower()
+        matches = [e for e in matches if d in (_get_field(e, "work", "department") or "").lower()]
+
+    if site:
+        s = site.lower()
+        matches = [e for e in matches if s in (_get_field(e, "work", "site") or "").lower()]
+
+    if not matches:
+        parts = []
+        if department:
+            parts.append(f"department='{department}'")
+        if site:
+            parts.append(f"site='{site}'")
+        return f"No employees found for {', '.join(parts)}."
+
+    lines = [f"Found {len(matches)} employees:\n"]
+    for emp in matches:
+        lines.append(_compact_display(emp))
+    return "\n".join(lines)
+
 
 @mcp.tool()
 def hibob_get_org_chart() -> str:
-    """
-    Get the complete organizational hierarchy as a compact tree.
-    Use this for ANY hierarchy or team question: who is the CEO, who reports to
-    whom, team structures, department breakdowns, manager lookups, org chart
-    traversal, how many people are in a team, etc.
-    Returns ALL employees in a tree format with name, title, department, and email.
-    """
-    fields = ["root.id", "root.firstName", "root.surname", "root.email",
-              "work.title", "work.reportsTo", "work.department"]
-    body = {"fields": fields}
-    result = _hibob_api_call("people/search", body)
-    employees = result.get("employees", [])
+    """Get the complete organizational hierarchy as a compact indented tree. Use for hierarchy, reporting lines, team structure, or manager lookups."""
+    employees = _get_all_employees()
 
-    # Resolve list field IDs to display values
-    employees = _resolve_list_values(employees, fields)
-
-    # Build employee lookup and parent-child relationships
     emp_by_id = {}
-    children = {}   # parent_id -> [child_ids]
-    roots = []      # employees with no manager
+    children = {}
+    roots = []
 
     for emp in employees:
         emp_id = _get_field(emp, "root", "id")
@@ -200,7 +294,6 @@ def hibob_get_org_chart() -> str:
         else:
             roots.append(emp_id)
 
-    # Render compact tree
     lines = [f"ORG CHART ({len(employees)} employees)\n"]
 
     def render_tree(eid, indent=0):
@@ -219,435 +312,241 @@ def hibob_get_org_chart() -> str:
     return "\n".join(lines)
 
 
-def _get_field(emp: dict, category: str, field_name: str):
-    """Get a field value from either dotted or slash-prefixed format."""
-    # Dotted format: emp["root"]["id"]
-    cat_data = emp.get(category)
-    if isinstance(cat_data, dict) and field_name in cat_data:
-        return cat_data[field_name]
-    # Slash format: emp["/root/id"]["value"]
-    slash_key = f"/{category}/{field_name}"
-    slash_data = emp.get(slash_key)
-    if isinstance(slash_data, dict) and "value" in slash_data:
-        return slash_data["value"]
-    return None
+def _get_policy_type_names() -> list:
+    try:
+        result = _hibob_api_call("timeoff/policy-types", method="GET")
+        if isinstance(result, list):
+            return [pt.get("name", pt) if isinstance(pt, dict) else str(pt) for pt in result]
+        if isinstance(result, dict) and "policyTypes" in result:
+            return [pt.get("name", pt) if isinstance(pt, dict) else str(pt) for pt in result["policyTypes"]]
+        return []
+    except Exception:
+        return []
 
 
-def _compact_display(emp: dict) -> str:
-    """Build a compact one-line display: Name | Title | Department | Email"""
-    first = _get_field(emp, "root", "firstName") or ""
-    last = _get_field(emp, "root", "surname") or ""
-    email = _get_field(emp, "root", "email") or ""
-    title = _get_field(emp, "work", "title") or ""
-    dept = _get_field(emp, "work", "department") or ""
+@mcp.tool()
+def hibob_get_timeoff_balance(employee_id: str, date: str = "") -> str:
+    """Get time-off balance for an employee across all policy types.
 
-    name = f"{first} {last}".strip() or "(unnamed)"
+    Parameters:
+        employee_id (str): The HiBob employee ID.
+        date (str, optional): Date for balance snapshot in YYYY-MM-DD format. Defaults to today.
+    """
+    from datetime import date as date_type
+    balance_date = date if date else date_type.today().isoformat()
+
+    policy_types = _get_policy_type_names()
+    if not policy_types:
+        return "Could not retrieve policy types. Check API permissions."
+
+    lines = []
+    for pt in policy_types:
+        try:
+            result = _hibob_api_call(
+                f"timeoff/employees/{employee_id}/balance",
+                method="GET",
+                params={"policyType": pt, "date": balance_date},
+            )
+        except Exception:
+            continue
+
+        if not isinstance(result, dict):
+            continue
+
+        assignment = result.get("currentAssignment", "")
+        if assignment == "Unassigned":
+            continue
+
+        policy_name = result.get("policy", pt)
+        balance = result.get("totalBalanceAsOfDate", "?")
+        taken = result.get("totalTaken", "?")
+        allowance = result.get("annualAllowance", "?")
+        lines.append(f"{policy_name}: {balance} remaining (taken {taken}, allowance {allowance})")
+
+    if not lines:
+        return f"No active time-off balances found for employee {employee_id} as of {balance_date}."
+
+    return f"Time-off balances as of {balance_date}:\n" + "\n".join(lines)
+
+
+def _format_out_entry(entry: dict) -> str:
+    if not isinstance(entry, dict):
+        return ""
+    name = entry.get("employeeDisplayName", "Unknown")
+    policy = entry.get("policyTypeDisplayName", "")
+    status = entry.get("status", "")
+    req_type = entry.get("type", "")
+
+    start = entry.get("startDate", entry.get("date", ""))
+    end = entry.get("endDate", "")
+
     parts = [name]
-    if title:
-        parts.append(title)
-    if dept:
-        parts.append(dept)
-    if email:
-        parts.append(email)
+    if policy:
+        parts.append(policy)
+    if status and status != "approved":
+        parts.append(f"[{status}]")
+    if start and end:
+        parts.append(f"{start} → {end}")
+    elif start:
+        parts.append(start)
+    if req_type == "hours":
+        hours = entry.get("hoursOnDate", "")
+        if hours:
+            parts.append(f"{hours}h")
+    elif req_type == "portionOnRange":
+        portion = entry.get("dayPortion", "")
+        if portion:
+            parts.append(portion)
     return " | ".join(parts)
 
 
 @mcp.tool()
-def hibob_get_employee_fields() -> dict:
-    """
-    Get metadata about all employee fields from HiBob.
-    Use this tool to discover available field paths for use in filters in hibob_people_search.
-    """
-    return _hibob_api_call("company/people/fields", method="GET")
-
-@mcp.tool()
-def hibob_update_employee(employeeId: str, fields: dict) -> dict:
-    """
-    Update specific fields in an employee's record in HiBob.
-    Only employee fields are supported; table updates are not allowed via this endpoint.
-    Parameters:
-        employeeId (string, mandatory): List of field paths to return for each employee. Use hibob_get_employee_fields to discover available fields.
-        fields (dict, mandatory): object with field to value for update. example: {"root.firstName": "NewName"}
-    Example usage:
-        hibob_update_employee("EMPLOYEE_ID", {"root.firstName": "NewName"})
-    To get available field for filters and fields, use the hibob_get_employee_fields tool.
-    See: https://apidocs.hibob.com/reference/put_people-identifier
-    """
-    endpoint = f"people/{employeeId}"
-    return _hibob_api_call(endpoint, body=fields, method="PUT")
-
-@mcp.tool()
-def hibob_get_timeoff_policy_types() -> dict:
-    """
-    Get a list of all timeoff policy type names from HiBob.
-    See: https://apidocs.hibob.com/reference/get_timeoff-policy-types
-    """
-    return _hibob_api_call("timeoff/policy-types", method="GET")
-
-@mcp.tool()
-def hibob_submit_timeoff_request(employee_id: str, request_details: dict) -> dict:
-    """
-    Submit a new time off request for an employee in HiBob.
-    
-    Parameters:
-        employee_id (str): The HiBob employee ID.
-        request_details (dict): The request body as required by the API. See the API docs for required fields for each request type.
-            Common parameters for a Holiday request include:
-                - type (str): The time off type, e.g., "Holiday"
-                - requestRangeType: Value must be 'days'. mandatory.
-                - startDatePortion: Value must be 'all_day'. mandatory.
-                - endDatePortion: Value must be 'all_day'. mandatory.
-                - startDate (str): Start date in YYYY-MM-DD format
-                - endDate (str): End date in YYYY-MM-DD format
-                - days (float): Number of days requested
-                - reason (str, optional): Reason for the request
-                - comment (str, optional): Additional comments
-                - halfDay (bool, optional): If the request is for a half day
-                - policyType (str, optional): Policy type name
-                - reasonCode (str, optional): Reason code if required by policy
-
-            Example:
-                hibob_submit_timeoff_request(
-                    "EMPLOYEE_ID",
-                    {
-                        "type": "Holiday",
-                        "startDate": "2024-07-01",
-                        "endDate": "2024-07-05",
-                        "startDatePortion": 'all_day',
-                        "endDatePortion": 'all_day',
-                        "requestRangeType": 'days',
-                        "reason": "Vacation",
-                        "comment": "Family trip",
-                        "halfDay": False
-                    }
-                )
-    
-    See: https://apidocs.hibob.com/reference/post_timeoff-employees-id-requests
-    """
-    endpoint = f"timeoff/employees/{employee_id}/requests"
-    return _hibob_api_call(endpoint, body=request_details, method="POST")
-
-@mcp.tool()
-def hibob_create_employee(fields: dict) -> dict:
-    """
-    Create a new employee record in HiBob.
+def hibob_whois_out(from_date: str, to_date: str) -> str:
+    """Check who is out of office in a date range.
 
     Parameters:
-        fields (dict): Dictionary of employee fields to set. Only fields listed in the Fields Metadata API are allowed.
-        check that you have site and startDate which are manadatory
-
-    Example usage:
-        hibob_create_employee({
-            "root.firstName": "Jane",
-            "root.surname": "Doe",
-            "root.email": "jane.doe@example.com"
+        from_date (str): Start date in YYYY-MM-DD format.
+        to_date (str): End date in YYYY-MM-DD format.
+    """
+    try:
+        result = _hibob_api_call("timeoff/whosout", method="GET", params={
+            "from": from_date, "to": to_date, "includePending": "true",
         })
+    except Exception as e:
+        return f"Error fetching who's out: {e}"
 
-    See: https://apidocs.hibob.com/reference/post_people
-    """
-    return _hibob_api_call("people", body=fields, method="POST")
+    outs = result.get("outs", []) if isinstance(result, dict) else (result if isinstance(result, list) else [])
+    if not outs:
+        return f"No one is out between {from_date} and {to_date}."
+
+    lines = [f"Out of office ({from_date} to {to_date}): {len(outs)} entries\n"]
+    for entry in outs:
+        line = _format_out_entry(entry)
+        if line:
+            lines.append(line)
+    return "\n".join(lines)
+
+
+def _format_today_entry(entry: dict) -> str:
+    if not isinstance(entry, dict):
+        return ""
+    name = entry.get("employeeDisplayName", "Unknown")
+    policy = entry.get("policyTypeDisplayName", "")
+    req_type = entry.get("requestRangeType", "")
+
+    start = entry.get("startDate", "")
+    end = entry.get("endDate", "")
+
+    parts = [name]
+    if policy:
+        parts.append(policy)
+    if start and end:
+        parts.append(f"{start} → {end}")
+    elif start:
+        parts.append(start)
+    if req_type == "hours":
+        hours = entry.get("hours", "")
+        mins = entry.get("minutes", 0)
+        if hours:
+            parts.append(f"{hours}h{mins}m" if mins else f"{hours}h")
+    elif req_type == "portionOnRange":
+        portion = entry.get("dayPortion", "")
+        if portion:
+            parts.append(portion)
+    elif req_type == "hoursOnRange":
+        daily = entry.get("dailyHours", "")
+        if daily:
+            parts.append(f"{daily}h/day")
+    return " | ".join(parts)
+
 
 @mcp.tool()
-def hibob_get_employee_tasks(employee_id: str) -> dict:
-    """
-    Get all tasks for a specific employee in HiBob.
+def hibob_get_today_out() -> str:
+    """Get who is out of office today. Use for quick "who's out?" questions without specific dates."""
+    from datetime import date as date_type
+    today = date_type.today().isoformat()
+    try:
+        result = _hibob_api_call("timeoff/outtoday", method="GET", params={
+            "today": today, "includeHourly": "true",
+        })
+    except Exception as e:
+        return f"Error fetching today's absences: {e}"
+
+    outs = result.get("outs", []) if isinstance(result, dict) else (result if isinstance(result, list) else [])
+    if not outs:
+        return f"No one is out today ({today})."
+
+    lines = [f"Out today ({today}): {len(outs)} people\n"]
+    for entry in outs:
+        line = _format_today_entry(entry)
+        if line:
+            lines.append(line)
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def hibob_submit_timeoff_request(employee_id: str, policy_type: str, start_date: str, end_date: str, reason: str = "") -> str:
+    """Submit a time-off request for an employee.
 
     Parameters:
         employee_id (str): The HiBob employee ID.
-
-    Example usage:
-        hibob_get_employee_tasks("EMPLOYEE_ID")
-
-    See: https://apidocs.hibob.com/reference/get_tasks-people-id
+        policy_type (str): The policy type name (e.g. "Holiday", "Sick Leave").
+        start_date (str): Start date in YYYY-MM-DD format.
+        end_date (str): End date in YYYY-MM-DD format.
+        reason (str, optional): Reason for the request.
     """
-    endpoint = f"tasks/people/{employee_id}"
-    return _hibob_api_call(endpoint, method="GET")
+    body = {
+        "policyType": policy_type,
+        "startDate": start_date,
+        "endDate": end_date,
+        "requestRangeType": "days",
+        "startDatePortion": "all_day",
+        "endDatePortion": "all_day",
+    }
+    if reason:
+        body["reason"] = reason
 
-# ===============================
-# Goals API Tools
-# ===============================
+    try:
+        result = _hibob_api_call(f"timeoff/employees/{employee_id}/requests", body=body, method="POST")
+        return f"Time-off request submitted successfully. {str(result) if result else ''}"
+    except Exception as e:
+        return f"Error submitting time-off request: {e}"
+
 
 @mcp.tool()
-def hibob_get_goal_types_metadata() -> dict:
-    """
-    Get metadata for goal types in HiBob Goals API.
-    This provides field definitions and metadata for goal type objects.
-
-    See: https://apidocs.hibob.com/reference/get_goals-goal-types-metadata
-    """
-    return _hibob_api_call("goals/goal-types/metadata", method="GET")
-
-@mcp.tool()
-def hibob_get_goals_metadata() -> dict:
-    """
-    Get metadata for goals in HiBob Goals API.
-    This provides field definitions and metadata for goal objects.
-
-    See: https://apidocs.hibob.com/reference/get_goals-goals-metadata
-    """
-    return _hibob_api_call("goals/goals/metadata", method="GET")
-
-@mcp.tool()
-def hibob_get_key_results_metadata() -> dict:
-    """
-    Get metadata for key results in HiBob Goals API.
-    This provides field definitions and metadata for key result objects.
-
-    See: https://apidocs.hibob.com/reference/get_goals-goals-key-results-metadata
-    """
-    return _hibob_api_call("goals/goals/key-results/metadata", method="GET")
-
-@mcp.tool()
-def hibob_search_goal_types(fields: list = None, filters: list = None) -> dict:
-    """
-    Search for goal types in HiBob using filters.
+def hibob_get_employee_tasks(employee_id: str) -> str:
+    """Get tasks for a specific employee.
 
     Parameters:
-        fields (list, optional): List of field paths to return for each goal type.
-        filters (list, optional): List of filter objects to apply to the search.
-
-    Example usage:
-        hibob_search_goal_types(
-            fields=["id", "name", "description"],
-            filters=[{"fieldPath": "name", "operator": "equals", "values": ["OKR"]}]
-        )
-
-    Use hibob_get_goal_types_metadata() to discover available fields.
-    See: https://apidocs.hibob.com/reference/post_goals-goal-types-search
+        employee_id (str): The HiBob employee ID.
     """
-    body = {}
-    if fields:
-        body["fields"] = fields
-    if filters:
-        body["filters"] = filters
-    return _hibob_api_call("goals/goal-types/search", body)
+    try:
+        result = _hibob_api_call(f"tasks/people/{employee_id}", method="GET")
+    except Exception as e:
+        return f"Error fetching tasks: {e}"
 
-@mcp.tool()
-def hibob_search_goals(fields: list = None, filters: list = None) -> dict:
-    """
-    Search for goals in HiBob using filters.
+    tasks = result if isinstance(result, list) else result.get("tasks", [])
+    if not tasks:
+        return "No tasks found for this employee."
 
-    Parameters:
-        fields (list, optional): List of field paths to return for each goal.
-        filters (list, optional): List of filter objects to apply to the search.
+    lines = [f"Tasks ({len(tasks)}):\n"]
+    for task in tasks:
+        if not isinstance(task, dict):
+            continue
+        title = task.get("title", task.get("name", "Untitled"))
+        status = task.get("status", "")
+        due = task.get("dueDate", task.get("date", ""))
+        desc = task.get("description", "")
+        parts = [f"- {title}"]
+        if status:
+            parts[0] += f" [{status}]"
+        if due:
+            parts[0] += f" (due: {due})"
+        if desc:
+            parts.append(f"  {desc[:200]}")
+        lines.append("\n".join(parts))
+    return "\n".join(lines)
 
-    Example usage:
-        hibob_search_goals(
-            fields=["id", "title", "status", "owner"],
-            filters=[{"fieldPath": "status", "operator": "equals", "values": ["active"]}]
-        )
-
-    Use hibob_get_goals_metadata() to discover available fields.
-    See: https://apidocs.hibob.com/reference/post_goals-goals-search
-    """
-    body = {}
-    if fields:
-        body["fields"] = fields
-    if filters:
-        body["filters"] = filters
-    return _hibob_api_call("goals/goals/search", body)
-
-@mcp.tool()
-def hibob_search_key_results(fields: list = None, filters: list = None) -> dict:
-    """
-    Search for key results in HiBob using filters.
-
-    Parameters:
-        fields (list, optional): List of field paths to return for each key result.
-        filters (list, optional): List of filter objects to apply to the search.
-
-    Example usage:
-        hibob_search_key_results(
-            fields=["id", "title", "progress", "target"],
-            filters=[{"fieldPath": "goalId", "operator": "equals", "values": ["GOAL_ID"]}]
-        )
-
-    Use hibob_get_key_results_metadata() to discover available fields.
-    See: https://apidocs.hibob.com/reference/post_goals-goals-key-results-search
-    """
-    body = {}
-    if fields:
-        body["fields"] = fields
-    if filters:
-        body["filters"] = filters
-    return _hibob_api_call("goals/goals/key-results/search", body)
-
-@mcp.tool()
-def hibob_create_goal(goal_data: dict) -> dict:
-    """
-    Create a new goal in HiBob.
-
-    Parameters:
-        goal_data (dict): The goal data including title, description, owner, etc.
-
-    Example usage:
-        hibob_create_goal({
-            "title": "Increase customer satisfaction",
-            "description": "Improve customer satisfaction scores by 15%",
-            "owner": "EMPLOYEE_ID",
-            "goalType": "GOAL_TYPE_ID",
-            "startDate": "2024-01-01",
-            "endDate": "2024-12-31"
-        })
-
-    Use hibob_get_goals_metadata() to discover required and available fields.
-    See: https://apidocs.hibob.com/reference/post_goals-goals
-    """
-    return _hibob_api_call("goals/goals", goal_data)
-
-@mcp.tool()
-def hibob_update_goal_status(goal_id: str, status_data: dict) -> dict:
-    """
-    Update the status of a goal in HiBob.
-
-    Parameters:
-        goal_id (str): The ID of the goal to update.
-        status_data (dict): The status update data.
-
-    Example usage:
-        hibob_update_goal_status("GOAL_ID", {
-            "status": "completed",
-            "comments": "Goal successfully achieved"
-        })
-
-    See: https://apidocs.hibob.com/reference/patch_goals-goals-goalid-status
-    """
-    endpoint = f"goals/goals/{goal_id}/status"
-    return _hibob_api_call(endpoint, status_data, method="PATCH")
-
-@mcp.tool()
-def hibob_update_goal(goal_id: str, goal_data: dict) -> dict:
-    """
-    Update a goal in HiBob.
-
-    Parameters:
-        goal_id (str): The ID of the goal to update.
-        goal_data (dict): The updated goal data.
-
-    Example usage:
-        hibob_update_goal("GOAL_ID", {
-            "title": "Updated goal title",
-            "description": "Updated description"
-        })
-
-    Use hibob_get_goals_metadata() to discover available fields.
-    See: https://apidocs.hibob.com/reference/patch_goals-goals-goalid
-    """
-    endpoint = f"goals/goals/{goal_id}"
-    return _hibob_api_call(endpoint, goal_data, method="PATCH")
-
-@mcp.tool()
-def hibob_delete_goal(goal_id: str) -> dict:
-    """
-    Delete a goal from HiBob.
-
-    Parameters:
-        goal_id (str): The ID of the goal to delete.
-
-    Example usage:
-        hibob_delete_goal("GOAL_ID")
-
-    See: https://apidocs.hibob.com/reference/delete_goals-goals-goalid
-    """
-    endpoint = f"goals/goals/{goal_id}"
-    return _hibob_api_call(endpoint, method="DELETE")
-
-@mcp.tool()
-def hibob_create_key_results(goal_id: str, key_results_data: dict) -> dict:
-    """
-    Create key results for a goal in HiBob.
-
-    Parameters:
-        goal_id (str): The ID of the goal to add key results to.
-        key_results_data (dict): The key results data.
-
-    Example usage:
-        hibob_create_key_results("GOAL_ID", {
-            "keyResults": [
-                {
-                    "title": "Achieve 95% customer satisfaction score",
-                    "description": "Measured via quarterly surveys",
-                    "target": 95,
-                    "unit": "percentage",
-                    "startValue": 85
-                }
-            ]
-        })
-
-    Use hibob_get_key_results_metadata() to discover required and available fields.
-    See: https://apidocs.hibob.com/reference/post_goals-goals-goalid-key-results
-    """
-    endpoint = f"goals/goals/{goal_id}/key-results"
-    return _hibob_api_call(endpoint, key_results_data)
-
-@mcp.tool()
-def hibob_update_key_results_progress(goal_id: str, progress_data: dict) -> dict:
-    """
-    Update the progress of key results for a goal in HiBob.
-
-    Parameters:
-        goal_id (str): The ID of the goal containing the key results.
-        progress_data (dict): The progress update data.
-
-    Example usage:
-        hibob_update_key_results_progress("GOAL_ID", {
-            "keyResults": [
-                {
-                    "id": "KEY_RESULT_ID",
-                    "currentValue": 90,
-                    "comments": "Good progress this quarter"
-                }
-            ]
-        })
-
-    See: https://apidocs.hibob.com/reference/patch_goals-goals-goalid-key-results-progress
-    """
-    endpoint = f"goals/goals/{goal_id}/key-results/progress"
-    return _hibob_api_call(endpoint, progress_data, method="PATCH")
-
-@mcp.tool()
-def hibob_update_key_results_details(goal_id: str, details_data: dict) -> dict:
-    """
-    Update the details of key results for a goal in HiBob.
-
-    Parameters:
-        goal_id (str): The ID of the goal containing the key results.
-        details_data (dict): The key results details update data.
-
-    Example usage:
-        hibob_update_key_results_details("GOAL_ID", {
-            "keyResults": [
-                {
-                    "id": "KEY_RESULT_ID",
-                    "title": "Updated key result title",
-                    "description": "Updated description",
-                    "target": 100
-                }
-            ]
-        })
-
-    Use hibob_get_key_results_metadata() to discover available fields.
-    See: https://apidocs.hibob.com/reference/patch_goals-goals-goalid-key-results
-    """
-    endpoint = f"goals/goals/{goal_id}/key-results"
-    return _hibob_api_call(endpoint, details_data, method="PATCH")
-
-@mcp.tool()
-def hibob_delete_key_result(goal_id: str, key_result_id: str) -> dict:
-    """
-    Delete a key result from a goal in HiBob.
-
-    Parameters:
-        goal_id (str): The ID of the goal containing the key result.
-        key_result_id (str): The ID of the key result to delete.
-
-    Example usage:
-        hibob_delete_key_result("GOAL_ID", "KEY_RESULT_ID")
-
-    See: https://apidocs.hibob.com/reference/delete_goals-goals-goalid-key-results-keyresultid
-    """
-    endpoint = f"goals/goals/{goal_id}/key-results/{key_result_id}"
-    return _hibob_api_call(endpoint, method="DELETE")
 
 if __name__ == "__main__":
     mcp.run(transport="stdio")
